@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: e2e-fastapi-azure
+  namespace: sandbox-e2e-fastapi-azure
+  labels:
+    app: e2e-fastapi-azure
+    sandbox: e2e-fastapi-azure
+    owner: group-default-platform-engineering
+    cost-center: "MC-100042"
+    tenant: mastercard
+  annotations:
+    mc/cost-center: "MC-100042"
+    mc/target-cloud: azure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: e2e-fastapi-azure
+  template:
+    metadata:
+      labels:
+        app: e2e-fastapi-azure
+        tenant: mastercard
+    spec:
+      containers:
+        - name: app
+          image: IMAGE_PLACEHOLDER  # replaced by deploy.yml with the ECR URI
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: SANDBOX_NAME
+              value: e2e-fastapi-azure
+            - name: COST_CENTER
+              value: "MC-100042"
+            - name: SERVICE_PORT
+              value: "8000"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 30

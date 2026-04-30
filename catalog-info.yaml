@@ -1,0 +1,20 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: e2e-fastapi-azure
+  title: E2e-fastapi-azure
+  description: E2E test: FastAPI on Azure
+  annotations:
+    mc/cost-center: "MC-100042"
+    mc/target-cloud: azure
+    mc/budget-cap-usd: "1000"
+    backstage.io/techdocs-ref: dir:.
+    github.com/project-slug: MSBXDemo/e2e-fastapi-azure
+  tags:
+    - python
+    - fastapi
+    - azure
+spec:
+  type: service
+  lifecycle: production
+  owner: group:default/platform-engineering

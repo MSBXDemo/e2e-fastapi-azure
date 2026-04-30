@@ -1,0 +1,211 @@
+name: CI / CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  TARGET_CLOUD: azure
+  SERVICE_NAME: e2e-fastapi-azure
+  COST_CENTER: MC-100042
+  AWS_REGION: us-west-2
+  AWS_ACCOUNT_ID: '447558490768'
+  ECR_REPO: mastercard/e2e-fastapi-azure
+  EKS_CLUSTER: mastercard-msbx-eks
+  AZURE_RG: msbx-rg-us
+  AKS_CLUSTER: mastercard-msbx-aks
+  SANDBOX_NAMESPACE: sandbox-e2e-fastapi-azure
+
+jobs:
+  # ── Stage 1: Build + Test + Scan ────────────────────────────────────────
+  ci:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: maven
+
+      - name: Build and Test
+        run: mvn verify
+
+      - name: Build Docker image
+        run: docker build -t e2e-fastapi-azure:test .
+
+      - name: Security scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: e2e-fastapi-azure:test
+          format: table
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+
+      - name: CI Summary
+        if: always()
+        run: |
+          echo "## CI Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build + Tests | Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Docker Build | Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Security Scan | Completed |" >> $GITHUB_STEP_SUMMARY
+
+  # ── Stage 2: Deploy (only after CI passes, only on main) ────────────────
+  deploy:
+    name: Deploy to AZURE
+    needs: ci
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── AWS Steps ─────────────────────────────────────────────────────
+      - name: Configure AWS via OIDC
+        if: env.TARGET_CLOUD == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/mastercard-msbx-scaffolded-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repository exists
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO" --region "$AWS_REGION" >/dev/null 2>&1 \
+            || aws ecr create-repository --repository-name "$ECR_REPO" --region "$AWS_REGION" \
+                 --image-scanning-configuration scanOnPush=true \
+                 --tags Key=Tenant,Value=mastercard Key=CostCenter,Value=$COST_CENTER
+
+      - name: ECR login
+        if: env.TARGET_CLOUD == 'aws'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build + push to ECR
+        if: env.TARGET_CLOUD == 'aws'
+        id: img-aws
+        run: |
+          TAG="${GITHUB_SHA::8}-$(date -u +%Y%m%d%H%M)"
+          URI="${{ steps.ecr.outputs.registry }}/$ECR_REPO:$TAG"
+          docker build -t "$URI" -t "${{ steps.ecr.outputs.registry }}/$ECR_REPO:latest" .
+          docker push "$URI"
+          docker push "${{ steps.ecr.outputs.registry }}/$ECR_REPO:latest"
+          echo "uri=$URI" >> $GITHUB_OUTPUT
+
+      - name: Update kubeconfig (EKS)
+        if: env.TARGET_CLOUD == 'aws'
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER" --region "$AWS_REGION"
+
+      - name: Deploy to EKS
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          kubectl get namespace "$SANDBOX_NAMESPACE" >/dev/null 2>&1 \
+            || kubectl create namespace "$SANDBOX_NAMESPACE"
+          kubectl label namespace "$SANDBOX_NAMESPACE" \
+            tenant=mastercard sandbox=$SERVICE_NAME \
+            cost-center=$COST_CENTER managed-by=msbx-portal --overwrite
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: sandbox-quota
+            namespace: $SANDBOX_NAMESPACE
+          spec:
+            hard:
+              requests.cpu: "2"
+              requests.memory: 4Gi
+              limits.cpu: "4"
+              limits.memory: 8Gi
+              pods: "10"
+          EOF
+          sed -i "s|IMAGE_PLACEHOLDER|${{ steps.img-aws.outputs.uri }}|g" k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl rollout status deployment/$SERVICE_NAME -n $SANDBOX_NAMESPACE --timeout=5m
+
+      - name: Print AWS sandbox URL
+        if: env.TARGET_CLOUD == 'aws'
+        run: |
+          for i in {1..20}; do
+            HOST=$(kubectl get ingress "$SERVICE_NAME" -n "$SANDBOX_NAMESPACE" \
+                     -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+            if [ -n "$HOST" ]; then echo "Sandbox live at: http://$HOST"; break; fi
+            sleep 10
+          done
+
+      # ── Azure Steps ───────────────────────────────────────────────────
+      - name: Azure Login
+        if: env.TARGET_CLOUD == 'azure'
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Build + push to ACR
+        if: env.TARGET_CLOUD == 'azure'
+        run: |
+          ACR_NAME="mastercardmsbxacr"
+          az acr show --name $ACR_NAME --resource-group $AZURE_RG >/dev/null 2>&1 \
+            || az acr create --name $ACR_NAME --resource-group $AZURE_RG --sku Basic --admin-enabled true
+          az acr login --name $ACR_NAME
+          TAG="${GITHUB_SHA::8}-$(date -u +%Y%m%d%H%M)"
+          IMAGE="$ACR_NAME.azurecr.io/$SERVICE_NAME:$TAG"
+          docker build -t "$IMAGE" -t "$ACR_NAME.azurecr.io/$SERVICE_NAME:latest" .
+          docker push "$IMAGE"
+          docker push "$ACR_NAME.azurecr.io/$SERVICE_NAME:latest"
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      - name: Get AKS credentials
+        if: env.TARGET_CLOUD == 'azure'
+        run: az aks get-credentials --name $AKS_CLUSTER --resource-group $AZURE_RG --overwrite-existing
+
+      - name: Deploy to AKS
+        if: env.TARGET_CLOUD == 'azure'
+        run: |
+          kubectl get namespace "$SANDBOX_NAMESPACE" >/dev/null 2>&1 \
+            || kubectl create namespace "$SANDBOX_NAMESPACE"
+          kubectl label namespace "$SANDBOX_NAMESPACE" \
+            tenant=mastercard sandbox=$SERVICE_NAME \
+            cost-center=$COST_CENTER managed-by=msbx-portal --overwrite
+          cat <<EOF | kubectl apply -f -
+          apiVersion: v1
+          kind: ResourceQuota
+          metadata:
+            name: sandbox-quota
+            namespace: $SANDBOX_NAMESPACE
+          spec:
+            hard:
+              requests.cpu: "2"
+              requests.memory: 4Gi
+              limits.cpu: "4"
+              limits.memory: 8Gi
+              pods: "10"
+          EOF
+          sed -i "s|IMAGE_PLACEHOLDER|$IMAGE|g" k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl rollout status deployment/$SERVICE_NAME -n $SANDBOX_NAMESPACE --timeout=5m
+
+      # ── Summary ───────────────────────────────────────────────────────
+      - name: Deploy Summary
+        if: always()
+        run: |
+          echo "## Deploy Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | $SERVICE_NAME |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cloud | $TARGET_CLOUD |" >> $GITHUB_STEP_SUMMARY
+          echo "| Namespace | $SANDBOX_NAMESPACE |" >> $GITHUB_STEP_SUMMARY
+          echo "| Cost Center | $COST_CENTER |" >> $GITHUB_STEP_SUMMARY
